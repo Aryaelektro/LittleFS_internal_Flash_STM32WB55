@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "lfs.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -31,7 +32,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define LFS_START_ADDR  0x08070000  // Starting address for LittleFS storage
+#define LFS_END_ADDR    0x0807FFFF  // Ending address for LittleFS storage
+#define LFS_BLOCK_SIZE  4096      // Flash block (page) size (typically 4KB)
+#define LFS_BLOCK_COUNT ((LFS_END_ADDR - LFS_START_ADDR + 1) / LFS_BLOCK_SIZE)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,7 +67,81 @@ static void MX_I2C1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+lfs_t lfs;
+lfs_file_t file;
 
+int _write(int32_t file, uint8_t *ptr, int32_t len)
+{
+    for (int i = 0; i < len; i++)
+    {
+        ITM_SendChar(*ptr++);
+    }
+    return len;
+}
+
+// Flash read, write, and erase functions
+int user_provided_block_device_read(const struct lfs_config *c, lfs_block_t block,
+                                    lfs_off_t off, void *buffer, lfs_size_t size) {
+//    printf("Reading block %d, offset %d, size %d\n", block, off, size);
+    memcpy(buffer, (const void*)(LFS_START_ADDR + (block *c->block_size) + off), size);
+    return 0;
+}
+
+int user_provided_block_device_prog(const struct lfs_config *c, lfs_block_t block,
+                                    lfs_off_t off, const void *buffer, lfs_size_t size) {
+//    printf("Programming block %d, offset %d, size %d\n", block, off, size);
+    HAL_FLASH_Unlock();
+    for (size_t i = 0; i < size; i += 8) {
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                          LFS_START_ADDR + (block *c->block_size) + off + i,
+                          *(uint64_t *)(buffer + i));
+    }
+    HAL_FLASH_Lock();
+    return LFS_ERR_OK;
+}
+
+int user_provided_block_device_erase(const struct lfs_config *c, lfs_block_t block) {
+    FLASH_EraseInitTypeDef erase_init;
+    uint32_t page_error = 0;
+
+    HAL_FLASH_Unlock();
+
+    uint32_t page = (LFS_START_ADDR + (block * c->block_size) - FLASH_BASE) / FLASH_PAGE_SIZE;
+    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase_init.Page = page;
+    erase_init.NbPages = 1;
+
+    HAL_FLASHEx_Erase(&erase_init, &page_error);
+
+    HAL_FLASH_Lock();
+    return 0;
+}
+
+int user_provided_block_device_sync(const struct lfs_config *c) {
+    // No special sync logic needed, return 0
+    return 0;
+}
+
+// Configuration struct
+struct lfs_config cfg = {
+    // Block device operations
+    .read  = user_provided_block_device_read,
+    .prog  = user_provided_block_device_prog,
+    .erase = user_provided_block_device_erase,
+    .sync  = user_provided_block_device_sync,
+
+	// Start and size of LittleFS storage region
+	.block_size = LFS_BLOCK_SIZE,
+	.block_count = LFS_BLOCK_COUNT,
+	.block_cycles = 100,  // You can adjust this based on expected erase cycles
+
+	// Adjust according to your flash characteristics
+	.read_size = 4,        // Smallest read size (e.g., 4 bytes)
+	.prog_size = 4,        // Smallest programmable size (e.g., 4 bytes)
+	.cache_size = 32,      // Adjust cache size (typical value is fine)
+	.lookahead_size = 32,  // Adjust lookahead size (typical value is fine)
+
+};
 /* USER CODE END 0 */
 
 /**
@@ -102,7 +180,53 @@ int main(void)
   MX_USB_PCD_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+  // Buffer to store read data
+  char buffer[100];
+  // Unlock the Flash memory for writing
+  HAL_FLASH_Unlock();
 
+  //=============================Mount the filesystem
+  int err = lfs_mount(&lfs, &cfg);
+  if (err) {
+	  lfs_format(&lfs, &cfg);
+	  lfs_mount(&lfs, &cfg);
+  }
+
+  //===========================overWrite data to the file (wronly+truncate)
+  const char *data1 = "Hello, Write Data \r\n!";
+  lfs_file_open(&lfs, &file, "myfile16.bin", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+  lfs_file_write(&lfs, &file, data1, strlen(data1));
+  lfs_file_close(&lfs, &file);
+
+  //===========================Read data from the file
+  lfs_file_open(&lfs, &file, "myfile16.bin", LFS_O_RDONLY);
+  memset(buffer, 0, sizeof(buffer));
+  lfs_file_read(&lfs, &file, buffer, sizeof(buffer));
+  lfs_file_close(&lfs, &file);
+  // Print the read data
+  HAL_UART_Transmit(&huart1, (const uint8_t*)buffer, sizeof(buffer), 100);
+  HAL_Delay(500);
+
+
+  //===========================Append file (wronly+append)
+  const char *data2 = "Hello, Appended Data \r\n!";
+  lfs_file_open(&lfs, &file, "myfile16.bin", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_APPEND);
+  lfs_file_write(&lfs, &file, data2, strlen(data2));
+  lfs_file_close(&lfs, &file);
+//  lfs_file_rewind(&lfs, &file);
+
+  lfs_file_open(&lfs, &file, "myfile16.bin", LFS_O_RDONLY);
+  memset(buffer, 0, sizeof(buffer));
+  lfs_file_read(&lfs, &file, buffer, sizeof(buffer));
+  lfs_file_close(&lfs, &file);
+  HAL_UART_Transmit(&huart1, (const uint8_t*)buffer, sizeof(buffer), 100);
+  HAL_Delay(500);
+
+  // Unmount the filesystem
+  lfs_unmount(&lfs);
+
+  // Lock the Flash memory to protect it
+  HAL_FLASH_Lock();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -112,7 +236,12 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
   }
+
   /* USER CODE END 3 */
 }
 
