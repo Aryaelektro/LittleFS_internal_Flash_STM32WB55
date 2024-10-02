@@ -18,11 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "lfs.h"
+#include "string.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "lfs.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -36,6 +36,8 @@
 #define LFS_END_ADDR    0x0807FFFF  // Ending address for LittleFS storage
 #define LFS_BLOCK_SIZE  4096      // Flash block (page) size (typically 4KB)
 #define LFS_BLOCK_COUNT ((LFS_END_ADDR - LFS_START_ADDR + 1) / LFS_BLOCK_SIZE)
+#define UART_BUFFER_SIZE 256
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,12 +48,15 @@
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
+RTC_HandleTypeDef hrtc;
+
 UART_HandleTypeDef huart1;
 
 PCD_HandleTypeDef hpcd_USB_FS;
 
 /* USER CODE BEGIN PV */
-
+const char *labels[2] = {"0", "1"}; //0 = bad 1 = good
+char uartBuffer[UART_BUFFER_SIZE];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -61,6 +66,7 @@ static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USB_PCD_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -81,20 +87,20 @@ int _write(int32_t file, uint8_t *ptr, int32_t len)
 
 // Flash read, write, and erase functions
 int user_provided_block_device_read(const struct lfs_config *c, lfs_block_t block,
-                                    lfs_off_t off, void *buffer, lfs_size_t size) {
+                                    lfs_off_t off, void *readBuffer, lfs_size_t size) {
 //    printf("Reading block %d, offset %d, size %d\n", block, off, size);
-    memcpy(buffer, (const void*)(LFS_START_ADDR + (block *c->block_size) + off), size);
-    return 0;
+    memcpy(readBuffer, (const void*)(LFS_START_ADDR + (block *c->block_size) + off), size);
+    return LFS_ERR_OK;
 }
 
 int user_provided_block_device_prog(const struct lfs_config *c, lfs_block_t block,
-                                    lfs_off_t off, const void *buffer, lfs_size_t size) {
+                                    lfs_off_t off, const void *readBuffer, lfs_size_t size) {
 //    printf("Programming block %d, offset %d, size %d\n", block, off, size);
     HAL_FLASH_Unlock();
     for (size_t i = 0; i < size; i += 8) {
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
                           LFS_START_ADDR + (block *c->block_size) + off + i,
-                          *(uint64_t *)(buffer + i));
+                          *(uint64_t *)(readBuffer + i));
     }
     HAL_FLASH_Lock();
     return LFS_ERR_OK;
@@ -142,6 +148,111 @@ struct lfs_config cfg = {
 	.lookahead_size = 32,  // Adjust lookahead size (typical value is fine)
 
 };
+
+void set_date (uint8_t year, uint8_t month, uint8_t date, uint8_t day)  // monday = 1
+{
+	RTC_DateTypeDef sDate = {0};
+	sDate.WeekDay = day;
+	sDate.Month = month;
+	sDate.Date = date;
+	sDate.Year = year;
+	if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN) != HAL_OK)
+	{
+		Error_Handler();
+	}
+
+	HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, 5);  // backup register
+}
+
+void set_time (uint8_t hr, uint8_t min, uint8_t sec)
+{
+	RTC_TimeTypeDef sTime = {0};
+	sTime.Hours = hr;
+	sTime.Minutes = min;
+	sTime.Seconds = sec;
+	sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+	sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+	if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN) != HAL_OK)
+	{
+		Error_Handler();
+	}
+}
+
+void get_time_date(char *time, char *date)
+{
+  RTC_DateTypeDef gDate;
+  RTC_TimeTypeDef gTime;
+
+  /* Get the RTC current Time */
+  HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BIN);
+  /* Get the RTC current Date */
+  HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BIN);
+
+  /* Display time Format: hh:mm:ss */
+  sprintf((char*)time,"%02d:%02d:%02d",gTime.Hours, gTime.Minutes, gTime.Seconds);
+
+  /* Display date Format: dd-mm-yyyy */
+  sprintf((char*)date,"%02d-%02d-%2d",gDate.Date, gDate.Month, 2000 + gDate.Year);
+}
+
+char timeData[15];
+char dateData[15];
+
+void transmit_file_via_uart(const char* filename) {
+    lfs_file_t file;
+    int err;
+
+    // Open the file for reading
+    err = lfs_file_open(&lfs, &file, filename, LFS_O_RDONLY);
+    if (err) {
+        printf("Failed to open file '%s' for reading: %d\n", filename, err);
+        return;
+    }
+
+    // Determine the size of the file
+    struct lfs_info info;
+    err = lfs_stat(&lfs, filename, &info);
+    if (err) {
+        printf("Failed to stat file '%s': %d\n", filename, err);
+        lfs_file_close(&lfs, &file);
+        return;
+    }
+
+    printf("Transmitting file '%s' (%lu bytes)...\n", filename, info.size);
+
+    // Allocate a buffer to read file data
+    size_t bytes_to_read = info.size;
+    size_t chunk_size = UART_BUFFER_SIZE; // Transmit in chunks
+    size_t total_transmitted = 0;
+
+    while (bytes_to_read > 0) {
+        size_t current_chunk = (bytes_to_read > chunk_size) ? chunk_size : bytes_to_read;
+
+        // Read a chunk of data from the file
+        err = lfs_file_read(&lfs, &file, uartBuffer, current_chunk);
+        if (err < 0) {
+            printf("Failed to read from file: %d\n", err);
+            lfs_file_close(&lfs, &file);
+            return;
+        }
+
+        // Transmit the chunk over UART
+        err = HAL_UART_Transmit(&huart1, (uint8_t*)uartBuffer, err, HAL_MAX_DELAY);
+        if (err != HAL_OK) {
+            printf("UART Transmit Error: %d\n", err);
+            lfs_file_close(&lfs, &file);
+            return;
+        }
+
+        total_transmitted += err;
+        bytes_to_read -= err;
+    }
+
+    printf("File transmission complete. Total bytes transmitted: %lu\n", total_transmitted);
+
+    // Close the file
+    lfs_file_close(&lfs, &file);
+}
 /* USER CODE END 0 */
 
 /**
@@ -179,10 +290,12 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USB_PCD_Init();
   MX_I2C1_Init();
+  MX_RTC_Init();
   /* USER CODE BEGIN 2 */
-  // Buffer to store read data
-  char buffer[100];
-  // Unlock the Flash memory for writing
+  // readBuffer to store read data
+  char readBuffer[200];
+  char writeBuffer[45];
+   // Unlock the Flash memory for writing
   HAL_FLASH_Unlock();
 
   //=============================Mount the filesystem
@@ -192,36 +305,43 @@ int main(void)
 	  lfs_mount(&lfs, &cfg);
   }
 
-  //===========================overWrite data to the file (wronly+truncate)
-  const char *data1 = "Hello, Write Data \r\n!";
-  lfs_file_open(&lfs, &file, "myfile16.bin", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
-  lfs_file_write(&lfs, &file, data1, strlen(data1));
-  lfs_file_close(&lfs, &file);
+  if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1) != 5)
+   {
+     HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+     HAL_Delay(100);
+     set_time(15, 27, 00);
+     set_date(24, 10, 2, 7);
+     //=========================== write log coloumn
+   const char *data1 = "timestamp,label,data1,data2 \r\n!";
+   lfs_file_open(&lfs, &file, "result1.csv", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+   lfs_file_write(&lfs, &file, data1, strlen(data1));
+   lfs_file_close(&lfs, &file);
+   }
 
-  //===========================Read data from the file
-  lfs_file_open(&lfs, &file, "myfile16.bin", LFS_O_RDONLY);
-  memset(buffer, 0, sizeof(buffer));
-  lfs_file_read(&lfs, &file, buffer, sizeof(buffer));
-  lfs_file_close(&lfs, &file);
-  // Print the read data
-  HAL_UART_Transmit(&huart1, (const uint8_t*)buffer, sizeof(buffer), 100);
-  HAL_Delay(500);
+   else
+   {
+     HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin);
+ 	HAL_Delay(100);
+   }
 
+  get_time_date(timeData, dateData);
 
   //===========================Append file (wronly+append)
-  const char *data2 = "Hello, Appended Data \r\n!";
-  lfs_file_open(&lfs, &file, "myfile16.bin", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_APPEND);
-  lfs_file_write(&lfs, &file, data2, strlen(data2));
+  sprintf(writeBuffer, "%s,%s,%s,%.1f,%.1f\n", dateData, timeData, labels[1], 90.1, 19.9);
+  lfs_file_open(&lfs, &file, "result1.csv", LFS_O_WRONLY | LFS_O_APPEND);
+  lfs_file_write(&lfs, &file, writeBuffer, strlen(writeBuffer));
   lfs_file_close(&lfs, &file);
-//  lfs_file_rewind(&lfs, &file);
 
-  lfs_file_open(&lfs, &file, "myfile16.bin", LFS_O_RDONLY);
-  memset(buffer, 0, sizeof(buffer));
-  lfs_file_read(&lfs, &file, buffer, sizeof(buffer));
-  lfs_file_close(&lfs, &file);
-  HAL_UART_Transmit(&huart1, (const uint8_t*)buffer, sizeof(buffer), 100);
-  HAL_Delay(500);
 
+//  lfs_file_open(&lfs, &file, "result1.csv", LFS_O_RDONLY);
+//  memset(readBuffer, 0, sizeof(readBuffer));
+//  lfs_file_read(&lfs, &file, readBuffer, sizeof(readBuffer));
+//  lfs_file_close(&lfs, &file);
+//  HAL_UART_Transmit(&huart1, (const uint8_t*)readBuffer, sizeof(readBuffer), 100);
+//  HAL_Delay(500);
+
+  // Example: Transmit a specific file
+  transmit_file_via_uart("result1.csv");
   // Unmount the filesystem
   lfs_unmount(&lfs);
 
@@ -274,8 +394,9 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE
-                              |RCC_OSCILLATORTYPE_LSE|RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI1
+                              |RCC_OSCILLATORTYPE_HSE|RCC_OSCILLATORTYPE_LSE
+                              |RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.LSEState = RCC_LSE_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
@@ -283,6 +404,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.MSICalibrationValue = RCC_MSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -379,6 +501,71 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+//  sTime.Hours = 0;
+//  sTime.Minutes = 0;
+//  sTime.Seconds = 0;
+//  sTime.SubSeconds = 0x0;
+//  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+//  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+//  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN) != HAL_OK)
+//  {
+//    Error_Handler();
+//  }
+//  sDate.WeekDay = RTC_WEEKDAY_SUNDAY;
+//  sDate.Month = RTC_MONTH_JANUARY;
+//  sDate.Date = 1;
+//  sDate.Year = 0;
+//
+//  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN) != HAL_OK)
+//  {
+//    Error_Handler();
+//  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
 
 }
 
